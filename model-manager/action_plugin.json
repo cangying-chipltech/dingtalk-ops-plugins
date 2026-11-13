@@ -1,0 +1,12 @@
+{
+  "apiVersion": 1,
+  "id": "model-manager",
+  "module": "model_manager_plugin",
+  "commandProvider": "COMMAND_PROVIDER",
+  "monitorProvider": "MONITOR_PROVIDER",
+  "services": {
+    "models": "SERVICE"
+  },
+  "requires": ["nodes"],
+  "pythonPath": "src"
+}

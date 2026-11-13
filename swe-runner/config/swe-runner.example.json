@@ -1,0 +1,17 @@
+{
+  "settings": {
+    "rawLines": 120,
+    "timeoutSeconds": 30,
+    "maxOutputChars": 8000,
+    "maxReplyChars": 12000
+  },
+  "default": "69",
+  "targets": {
+    "69": {
+      "aliases": ["10.0.10.69", "69"],
+      "node": "worker-01",
+      "queue": "10.0.10.69",
+      "remoteDir": "/mnt/jfs/tools/swe-runner"
+    }
+  }
+}

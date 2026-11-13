@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+**/data/
+nodes/config/nodes.json
+swe-runner/config/swe-runner.json
+model-manager/config/models.json

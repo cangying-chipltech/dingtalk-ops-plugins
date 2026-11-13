@@ -1,0 +1,49 @@
+{
+  "actions": {
+    "node-login": {
+      "type": "node",
+      "description": "验证节点 SSH 登录并返回主机名",
+      "remoteCommand": "hostname",
+      "timeoutSeconds": 20,
+      "parameters": {
+        "node": {
+          "type": "node",
+          "required": true,
+          "description": "节点插件中的节点名称"
+        }
+      }
+    },
+    "node-info": {
+      "type": "node",
+      "description": "查看节点主机名、运行时间和当前用户",
+      "remoteCommand": "hostname && uptime && whoami",
+      "timeoutSeconds": 20,
+      "parameters": {
+        "node": {
+          "type": "node",
+          "required": true,
+          "description": "节点插件中的节点名称"
+        }
+      }
+    },
+    "node-disk": {
+      "type": "node",
+      "description": "查看节点磁盘使用情况",
+      "remoteCommand": "df -hP",
+      "timeoutSeconds": 20,
+      "parameters": {
+        "node": {
+          "type": "node",
+          "required": true,
+          "description": "节点插件中的节点名称"
+        }
+      }
+    }
+  },
+  "batches": {
+    "node-health": {
+      "description": "节点登录、基础信息和磁盘检查",
+      "actions": ["node-login", "node-info", "node-disk"]
+    }
+  }
+}

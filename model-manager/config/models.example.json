@@ -1,0 +1,17 @@
+{
+  "models": {
+    "vllm-worker-01": {
+      "description": "worker-01 vLLM 实例日志监控",
+      "node": "web-01",
+      "logPath": "/data/applogs/vllm.log",
+      "tailLines": 10,
+      "alertPatterns": ["No available shared memory broadcast"],
+      "intervalSeconds": 60,
+      "timeoutSeconds": 20,
+      "severity": "critical",
+      "repeatAlertSeconds": 0,
+      "notifyRecovery": true,
+      "enabled": true
+    }
+  }
+}

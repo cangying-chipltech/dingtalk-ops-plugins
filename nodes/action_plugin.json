@@ -1,0 +1,11 @@
+{
+  "apiVersion": 1,
+  "module": "nodes_plugin",
+  "provider": "PROVIDER",
+  "commandProvider": "COMMAND_PROVIDER",
+  "services": {
+    "nodes": "SERVICE"
+  },
+  "actionsFile": "config/actions.json",
+  "pythonPath": "src"
+}

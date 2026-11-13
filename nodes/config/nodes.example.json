@@ -1,0 +1,32 @@
+{
+  "nodes": {
+    "web-01": {
+      "description": "Web 节点示例，密码来自环境变量",
+      "host": "10.0.0.11",
+      "port": 22,
+      "user": "ops",
+      "passwordEnv": "NODE_WEB01_SSH_PASSWORD",
+      "strictHostKeyChecking": "accept-new",
+      "connectTimeoutSeconds": 10
+    },
+    "worker-01": {
+      "description": "Worker 节点示例，使用 SSH 私钥",
+      "host": "10.0.0.12",
+      "port": 22,
+      "user": "ops",
+      "identityFile": "../../../data/ssh/id_ed25519_worker",
+      "knownHostsFile": "../../../data/known_hosts",
+      "strictHostKeyChecking": "yes",
+      "connectTimeoutSeconds": 10
+    },
+    "db-01": {
+      "description": "数据库节点示例，密码来自环境变量",
+      "host": "10.0.0.13",
+      "port": 2222,
+      "user": "dba",
+      "passwordEnv": "NODE_DB01_SSH_PASSWORD",
+      "strictHostKeyChecking": "accept-new",
+      "connectTimeoutSeconds": 10
+    }
+  }
+}
