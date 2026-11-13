@@ -59,7 +59,16 @@ class ModelManagerPluginTests(unittest.TestCase):
                             "alertPatterns": ["No available shared memory broadcast"],
                             "monitorName": "vllm-shared-memory-27",
                         }
-                    }
+                    },
+                    "services": {
+                        "newapi-205": {
+                            "node": "web-01",
+                            "container": "new-api",
+                            "url": "http://127.0.0.1:3000/api/status",
+                            "expectedStatus": 200,
+                            "monitorName": "newapi-status-205",
+                        }
+                    },
                 }
             ),
             encoding="utf-8",
@@ -118,6 +127,80 @@ class ModelManagerPluginTests(unittest.TestCase):
         self.assertIn("模型清单", output)
         self.assertIn("vllm-27", output)
         self.assertIn("vllm-shared-memory-27", output)
+        self.assertIn("服务监控", output)
+        self.assertIn("newapi-205", output)
+        self.assertIn("newapi-status-205", output)
+
+    def test_service_monitor_definitions_are_generated_from_config(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            monitors = self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
+        monitor = monitors["newapi-status-205"]
+        self.assertEqual(
+            monitor["check"],
+            {"type": "node-service", "service": "newapi-205"},
+        )
+        self.assertEqual(monitor["severity"], "critical")
+        self.assertEqual(monitor["intervalSeconds"], 60)
+        self.assertTrue(monitor["enabled"])
+
+    def test_service_monitor_rejects_unknown_node(self):
+        self.nodes.known.clear()
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            with self.assertRaisesRegex(ActionValidationError, "unknown node"):
+                self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
+
+    def test_service_check_reports_healthy_container_and_http_endpoint(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            with mock.patch.object(self.plugin, "_run_process") as run:
+                run.return_value = self.plugin._ProcessResult(0, "", "", False, 8)
+                result = self.plugin.SERVICE_MONITOR_PROVIDER.check(
+                    {"service": "newapi-205"}, self.context
+                )
+        self.assertTrue(result.ok)
+        self.assertIn("服务状态正常", result.message)
+        self.assertIn("docker inspect -f '{{.State.Running}}' new-api", self.nodes.last_remote)
+        self.assertIn("curl -sS --max-time 5", self.nodes.last_remote)
+        self.assertIn("http://127.0.0.1:3000/api/status", self.nodes.last_remote)
+
+    def test_service_check_reports_stopped_container(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            with mock.patch.object(self.plugin, "_run_process") as run:
+                run.return_value = self.plugin._ProcessResult(
+                    3, "", "container not running: new-api", False, 8
+                )
+                result = self.plugin.SERVICE_MONITOR_PROVIDER.check(
+                    {"service": "newapi-205"}, self.context
+                )
+        self.assertFalse(result.ok)
+        self.assertIn("容器未运行", result.message)
+        self.assertIn("container not running", result.details)
+
+    def test_service_check_reports_unexpected_http_status(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            with mock.patch.object(self.plugin, "_run_process") as run:
+                run.return_value = self.plugin._ProcessResult(
+                    5, "", "unexpected HTTP status: 503", False, 8
+                )
+                result = self.plugin.SERVICE_MONITOR_PROVIDER.check(
+                    {"service": "newapi-205"}, self.context
+                )
+        self.assertFalse(result.ok)
+        self.assertIn("HTTP 状态异常", result.message)
+        self.assertIn("503", result.details)
+
+    def test_service_config_requires_container_or_url(self):
+        self.config.write_text(
+            json.dumps(
+                {
+                    "models": {},
+                    "services": {"broken": {"node": "web-01"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            with self.assertRaisesRegex(ActionValidationError, "container.*url"):
+                self.plugin._load_catalog(self.context)
 
     def test_model_config_requires_absolute_log_path(self):
         self.config.write_text(

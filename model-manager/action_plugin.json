@@ -3,7 +3,7 @@
   "id": "model-manager",
   "module": "model_manager_plugin",
   "commandProvider": "COMMAND_PROVIDER",
-  "monitorProvider": "MONITOR_PROVIDER",
+  "monitorProviders": ["MONITOR_PROVIDER", "SERVICE_MONITOR_PROVIDER"],
   "services": {
     "models": "SERVICE"
   },

@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -53,14 +54,44 @@ class ModelDefinition:
 
 
 @dataclass(frozen=True)
+class ServiceDefinition:
+    name: str
+    node: str
+    description: str = ""
+    monitor_name: str = ""
+    container: str = ""
+    url: str = ""
+    expected_status: int = 200
+    url_timeout_seconds: float = 5.0
+    interval_seconds: float = 60.0
+    timeout_seconds: float = 20.0
+    severity: str = "critical"
+    repeat_alert_seconds: float = 0.0
+    notify_recovery: bool = True
+    enabled: bool = True
+
+    @property
+    def effective_monitor_name(self) -> str:
+        return self.monitor_name or f"model-manager-{self.name}-service"
+
+
+@dataclass(frozen=True)
 class ModelCatalog:
     models: Mapping[str, ModelDefinition] = field(default_factory=dict)
+    services: Mapping[str, ServiceDefinition] = field(default_factory=dict)
 
     def resolve(self, name: str) -> ModelDefinition | None:
         wanted = str(name).strip().casefold()
         for model_name, model in self.models.items():
             if model_name.casefold() == wanted:
                 return model
+        return None
+
+    def resolve_service(self, name: str) -> ServiceDefinition | None:
+        wanted = str(name).strip().casefold()
+        for service_name, service in self.services.items():
+            if service_name.casefold() == wanted:
+                return service
         return None
 
 
@@ -146,6 +177,81 @@ class ModelMonitorProvider:
         return MonitorResult(False, message, details or location)
 
 
+class ServiceMonitorProvider:
+    api_version = PLUGIN_API_VERSION
+    type_name = "node-service"
+
+    def monitors(self, context: ActionContext) -> Mapping[str, Mapping[str, Any]]:
+        catalog = _load_catalog(context)
+        nodes = context.require_service(NODES_SERVICE)
+        monitors: dict[str, Mapping[str, Any]] = {}
+        for service in catalog.services.values():
+            if nodes.resolve(service.node, context) is None:
+                raise ModelManagerError(
+                    f"service {service.name!r} references unknown node {service.node!r}"
+                )
+            monitors[service.effective_monitor_name] = {
+                "description": service.description
+                or f"{service.name} 服务健康检查（{service.node}）",
+                "check": {"type": self.type_name, "service": service.name},
+                "intervalSeconds": service.interval_seconds,
+                "timeoutSeconds": service.timeout_seconds,
+                "severity": service.severity,
+                "repeatAlertSeconds": service.repeat_alert_seconds,
+                "notifyRecovery": service.notify_recovery,
+                "enabled": service.enabled,
+            }
+        return monitors
+
+    def validate(self, check: Mapping[str, Any]) -> None:
+        if not _optional_string(check.get("service")):
+            raise ModelManagerError("node-service check requires 'service'")
+
+    def check(self, check: Mapping[str, Any], context: ActionContext) -> MonitorResult:
+        service_name = _optional_string(check.get("service"))
+        if not service_name:
+            return MonitorResult(False, "node-service check requires 'service'")
+        service = _load_catalog(context).resolve_service(service_name)
+        if service is None:
+            return MonitorResult(False, f"unknown service: {service_name}")
+
+        nodes = context.require_service(NODES_SERVICE)
+        ssh = nodes.ssh_command(service.node, _remote_service_command(service), context)
+        env = _materialize_env(ssh.env)
+        process = _run_process(
+            ssh.argv,
+            timeout_seconds=service.timeout_seconds,
+            env=env,
+            max_output_chars=MAX_DETAILS_CHARS,
+        )
+        location = _service_location(service)
+        if process.timed_out:
+            return MonitorResult(
+                False,
+                f"服务检查超时（{service.timeout_seconds:g}s）",
+                location,
+            )
+        if process.exit_code == 0:
+            return MonitorResult(True, "服务状态正常", location)
+
+        details = _truncate_text(
+            (process.stderr or process.stdout).strip(),
+            MAX_DETAILS_CHARS,
+        )
+        if process.exit_code == 3:
+            return MonitorResult(False, "服务容器未运行", details or location)
+        if process.exit_code == 4:
+            return MonitorResult(False, "服务健康检查请求失败", details or location)
+        if process.exit_code == 5:
+            return MonitorResult(
+                False,
+                f"服务 HTTP 状态异常（期望 {service.expected_status}）",
+                details or location,
+            )
+        message = process.error or f"SSH 服务检查失败，退出码 {process.exit_code}"
+        return MonitorResult(False, message, details or location)
+
+
 class ModelManagerCommandProvider:
     api_version = PLUGIN_API_VERSION
     command_prefixes = ("model", "models", "模型")
@@ -214,7 +320,15 @@ def _load_catalog(context: ActionContext | None = None) -> ModelCatalog:
         if not isinstance(item, dict):
             raise ModelManagerError(f"model {name!r} must be an object")
         models[name] = _parse_model(name, item)
-    return ModelCatalog(models=models)
+    services_raw = raw.get("services", {})
+    if not isinstance(services_raw, dict):
+        raise ModelManagerError("'services' must be an object")
+    services: dict[str, ServiceDefinition] = {}
+    for name, item in services_raw.items():
+        if not isinstance(item, dict):
+            raise ModelManagerError(f"service {name!r} must be an object")
+        services[name] = _parse_service(name, item)
+    return ModelCatalog(models=models, services=services)
 
 
 def _parse_model(name: str, item: Mapping[str, Any]) -> ModelDefinition:
@@ -278,6 +392,69 @@ def _parse_model(name: str, item: Mapping[str, Any]) -> ModelDefinition:
     )
 
 
+def _parse_service(name: str, item: Mapping[str, Any]) -> ServiceDefinition:
+    if MODEL_NAME_RE.fullmatch(name) is None:
+        raise ModelManagerError(
+            f"invalid service name {name!r}; use letters, digits, dot, underscore or dash"
+        )
+    node = _optional_string(item.get("node"))
+    container = _optional_string(item.get("container")) or ""
+    url = _optional_string(item.get("url")) or ""
+    if not node:
+        raise ModelManagerError(f"service {name!r} requires 'node'")
+    if not container and not url:
+        raise ModelManagerError(f"service {name!r} requires 'container' or 'url'")
+    if url:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ModelManagerError(
+                f"service {name!r} requires an absolute HTTP(S) 'url'"
+            )
+
+    monitor_name = _optional_string(item.get("monitorName")) or f"model-manager-{name}-service"
+    if MONITOR_NAME_RE.fullmatch(monitor_name) is None:
+        raise ModelManagerError(f"service {name!r} has invalid monitorName {monitor_name!r}")
+    severity = str(item.get("severity", "critical")).strip().lower()
+    if severity not in SEVERITIES:
+        raise ModelManagerError(f"service {name!r} severity must be info, warning, or critical")
+    return ServiceDefinition(
+        name=name,
+        node=node,
+        description=str(item.get("description", "")),
+        monitor_name=monitor_name,
+        container=container,
+        url=url,
+        expected_status=_bounded_int(
+            item.get("expectedStatus", 200),
+            f"service {name}.expectedStatus",
+            100,
+            599,
+        ),
+        url_timeout_seconds=_positive_float(
+            item.get("urlTimeoutSeconds", 5),
+            f"service {name}.urlTimeoutSeconds",
+        ),
+        interval_seconds=_positive_float(
+            item.get("intervalSeconds", 60),
+            f"service {name}.intervalSeconds",
+        ),
+        timeout_seconds=_positive_float(
+            item.get("timeoutSeconds", 20),
+            f"service {name}.timeoutSeconds",
+        ),
+        severity=severity,
+        repeat_alert_seconds=_non_negative_float(
+            item.get("repeatAlertSeconds", 0),
+            f"service {name}.repeatAlertSeconds",
+        ),
+        notify_recovery=_as_bool(
+            item.get("notifyRecovery", True),
+            f"service {name}.notifyRecovery",
+        ),
+        enabled=_as_bool(item.get("enabled", True), f"service {name}.enabled"),
+    )
+
+
 def _config_file() -> Path:
     configured = os.getenv("MODEL_MANAGER_CONFIG")
     if configured:
@@ -297,6 +474,44 @@ def _remote_log_command(model: ModelDefinition) -> str:
         f"printf '%s\\n' \"$last\" | grep -F {grep_args} >&2; exit 1; fi; "
         "exit 0"
     )
+
+
+def _remote_service_command(service: ServiceDefinition) -> str:
+    container_check = ""
+    if service.container:
+        container = shlex.quote(service.container)
+        container_error = shlex.quote(f"container not running: {service.container}")
+        container_check = (
+            "if ! command -v docker >/dev/null 2>&1; then "
+            "echo 'docker command not found' >&2; exit 4; fi; "
+            f"running=$(docker inspect -f '{{{{.State.Running}}}}' {container} "
+            "2>/dev/null || true); "
+            f"if [ \"$running\" != true ]; then echo {container_error} >&2; exit 3; fi; "
+        )
+
+    http_check = ""
+    if service.url:
+        url = shlex.quote(service.url)
+        request_error = shlex.quote(f"request failed: {service.url}")
+        http_check = (
+            "if ! command -v curl >/dev/null 2>&1; then "
+            "echo 'curl command not found' >&2; exit 4; fi; "
+            f"code=$(curl -sS --max-time {service.url_timeout_seconds:g} "
+            f"-o /dev/null -w '%{{http_code}}' {url}) || "
+            f"{{ echo {request_error} >&2; exit 4; }}; "
+            f"if [ \"$code\" != {shlex.quote(str(service.expected_status))} ]; then "
+            f"echo \"unexpected HTTP status: $code\" >&2; exit 5; fi; "
+        )
+    return container_check + http_check + "exit 0"
+
+
+def _service_location(service: ServiceDefinition) -> str:
+    parts = [f"service={service.name}", f"node={service.node}"]
+    if service.container:
+        parts.append(f"container={service.container}")
+    if service.url:
+        parts.append(f"url={service.url}")
+    return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -385,6 +600,22 @@ def _format_model_list(catalog: ModelCatalog) -> str:
             f"| `{model.name}` | `{model.node}` | `{model.log_path}` | "
             f"{patterns} | `{model.effective_monitor_name}` |"
         )
+    if catalog.services:
+        lines.extend(
+            [
+                "",
+                "### 服务监控",
+                "",
+                "| 服务 | 节点 | 容器 | URL | 监控项 |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for service in sorted(catalog.services.values(), key=lambda item: item.name):
+            lines.append(
+                f"| `{service.name}` | `{service.node}` | "
+                f"{_inline_code(service.container)} | {_inline_code(service.url)} | "
+                f"`{service.effective_monitor_name}` |"
+            )
     lines.extend(["", "使用示例：`model check vllm-27`。"])
     return "\n".join(lines)
 
@@ -433,9 +664,13 @@ def _format_help(catalog: ModelCatalog) -> str:
             "- `model list`：列出模型和监控项",
             "- `model check [名称,...]`：立即检查模型日志",
             "",
-            "日志异常会由插件声明的监控项上报钉钉 Webhook。",
+            "模型日志和服务健康异常会由插件声明的监控项上报钉钉 Webhook。",
         ]
     )
+
+
+def _inline_code(value: str) -> str:
+    return f"`{value}`" if value else "-"
 
 
 def _optional_string(value: Any) -> str | None:
@@ -502,3 +737,4 @@ def _truncate_text(text: str, limit: int) -> str:
 SERVICE = ModelService()
 COMMAND_PROVIDER = ModelManagerCommandProvider()
 MONITOR_PROVIDER = ModelMonitorProvider()
+SERVICE_MONITOR_PROVIDER = ServiceMonitorProvider()

@@ -13,5 +13,21 @@
       "notifyRecovery": true,
       "enabled": true
     }
+  },
+  "services": {
+    "newapi-205": {
+      "description": "205 new-api 容器与 API 健康检查",
+      "node": "hangdian2-205",
+      "container": "new-api",
+      "url": "http://127.0.0.1:3000/api/status",
+      "expectedStatus": 200,
+      "monitorName": "newapi-status-205",
+      "intervalSeconds": 60,
+      "timeoutSeconds": 20,
+      "urlTimeoutSeconds": 5,
+      "severity": "critical",
+      "notifyRecovery": true,
+      "enabled": true
+    }
   }
 }
