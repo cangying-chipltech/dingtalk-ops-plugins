@@ -27,6 +27,12 @@ from .alerts import (
     save_management,
 )
 from .model_state import ModelStateError, load_models, save_models, state_file
+from .service_state import (
+    ServiceStateError,
+    load_state as load_service_state,
+    save_state as save_service_state,
+    state_file as service_state_file,
+)
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
@@ -37,6 +43,7 @@ ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 SEVERITIES = {"info", "warning", "critical"}
 MODEL_COMMANDS = {"model", "models", "模型"}
 ALERT_COMMANDS = {"alert", "alerts", "告警"}
+SERVICE_COMMANDS = {"service", "services", "服务"}
 ALERT_TYPES = {"model-log", "node-service", "http", "tcp", "command"}
 MAX_DETAILS_CHARS = 4000
 
@@ -283,7 +290,9 @@ class ServiceMonitorProvider:
 
 class ModelManagerCommandProvider:
     api_version = PLUGIN_API_VERSION
-    command_prefixes = tuple(sorted(MODEL_COMMANDS | ALERT_COMMANDS))
+    command_prefixes = tuple(
+        sorted(MODEL_COMMANDS | ALERT_COMMANDS | SERVICE_COMMANDS)
+    )
 
     def handle(self, prompt: str, context: ActionContext) -> str | None:
         text = (prompt or "").strip()
@@ -296,6 +305,8 @@ class ModelManagerCommandProvider:
         rest = parts[1].strip() if len(parts) > 1 else ""
         if command in ALERT_COMMANDS:
             return self._alert(rest, context)
+        if command in SERVICE_COMMANDS:
+            return self._service(rest, context)
         if not rest:
             return _format_help(_load_catalog(context))
 
@@ -322,8 +333,41 @@ class ModelManagerCommandProvider:
         if subcommand in {"check", "status", "monitor", "检查", "状态"}:
             return self._check(argument.strip(), context)
         if subcommand in {"help", "?", "/help", "帮助"}:
-            return _format_help(_load_catalog(context))
+            topic = f"{command} {argument}".strip()
+            return self.help(topic, context) or _format_help(_load_catalog(context))
         return _format_help(_load_catalog(context))
+
+    def help(self, topic: str, context: ActionContext) -> str | None:
+        text = (topic or "").strip()
+        if not text:
+            return _format_help(_load_catalog(context))
+        tokens = text.split()
+        command = tokens[0].casefold()
+        if command in MODEL_COMMANDS:
+            if len(tokens) == 1:
+                return _format_help(_load_catalog(context))
+            return _format_model_command_help(tokens[1].casefold())
+        if command in ALERT_COMMANDS:
+            if len(tokens) == 1:
+                return _format_alert_help()
+            detail = tokens[1].casefold()
+            if detail in {
+                "list",
+                "disable",
+                "enable",
+                "remove",
+                "restore",
+                "add",
+                "help",
+            }:
+                nested = tokens[2].casefold() if len(tokens) > 2 else None
+                return _format_alert_command_help(detail, nested)
+            return _format_alert_help(detail)
+        if command in SERVICE_COMMANDS:
+            if len(tokens) == 1:
+                return _format_service_help()
+            return _format_service_command_help(tokens[1].casefold()) or _format_service_help()
+        return None
 
     def _check(self, argument: str, context: ActionContext) -> str:
         catalog = _load_catalog(context)
@@ -364,13 +408,69 @@ class ModelManagerCommandProvider:
                 )
                 return _format_alert_change("添加", (name,), definition)
             if subcommand in {"help", "?", "/help", "帮助", "describe", "详情", "说明"}:
-                detail = tokens[1].casefold() if len(tokens) > 1 else None
+                if len(tokens) == 1:
+                    return _format_alert_help()
+                detail = tokens[1].casefold()
+                if detail in {
+                    "list",
+                    "disable",
+                    "enable",
+                    "remove",
+                    "restore",
+                    "add",
+                    "help",
+                }:
+                    nested = tokens[2].casefold() if len(tokens) > 2 else None
+                    return _format_alert_command_help(detail, nested)
                 return _format_alert_help(detail)
             raise ModelManagerError(
                 "alert 支持 `list`、`disable`、`enable`、`remove`、`restore` 或 `add`"
             )
         except (AlertManagementError, ModelManagerError, ValueError) as exc:
             return _format_alert_error(str(exc))
+
+    def _service(self, argument: str, context: ActionContext) -> str:
+        try:
+            tokens = shlex.split(argument)
+            if not tokens:
+                return _format_service_list(context)
+            subcommand = tokens[0].casefold()
+            if subcommand in {"list", "ls", "状态", "列表"}:
+                return _format_service_list(context)
+            if subcommand in {"add", "create", "添加", "新增"}:
+                name, definition = _add_service(
+                    _parse_service_parameters(tokens[1:]), context
+                )
+                return _format_service_change("添加", name, definition)
+            if subcommand in {"update", "edit", "修改", "更新"}:
+                name, definition = _update_service(
+                    _parse_service_parameters(tokens[1:]), context
+                )
+                return _format_service_change("更新", name, definition)
+            if subcommand in {"remove", "delete", "rm", "移出", "移除", "删除"}:
+                return _manage_services("移出", tokens[1:], context)
+            if subcommand in {"restore", "恢复"}:
+                return _manage_services("恢复", tokens[1:], context)
+            if subcommand in {"check", "status", "monitor", "检查"}:
+                return _check_services(tokens[1:], context)
+            if subcommand in {"help", "?", "/help", "帮助", "describe", "详情", "说明"}:
+                if len(tokens) == 1:
+                    return _format_service_help()
+                return (
+                    _format_service_command_help(tokens[1].casefold())
+                    or _format_service_help()
+                )
+            raise ModelManagerError(
+                "service 支持 `list`、`add`、`update`、`remove`、`restore` 或 `check`"
+            )
+        except (
+            ActionError,
+            AlertManagementError,
+            ModelManagerError,
+            ServiceStateError,
+            ValueError,
+        ) as exc:
+            return _format_service_error(str(exc))
 
     def help_lines(self) -> list[str]:
         return [
@@ -380,6 +480,11 @@ class ModelManagerCommandProvider:
             "- `alert list`：查看模型插件告警项状态",
             "- `alert disable|enable|remove|restore <名称,...>`：管理告警项",
             "- `alert add name=<名称> type=<类型> [参数...]`：添加告警项",
+            "- `service list`：列出节点服务监控",
+            "- `service add name=<名称> node=<节点> container=<容器>|url=<URL> [参数...]`：添加服务",
+            "- `service update name=<名称> [字段...]`：更新静态或动态服务",
+            "- `service remove|restore <名称,...>`：移出或恢复服务",
+            "- `service check [名称,...]`：立即检查服务",
         ]
 
 
@@ -665,6 +770,214 @@ def _add_model(parameters: Mapping[str, str], context: ActionContext) -> ModelDe
     return model
 
 
+def _add_service(
+    parameters: Mapping[str, str],
+    context: ActionContext,
+) -> tuple[str, ServiceDefinition]:
+    values = dict(parameters)
+    name = str(values.pop("name", "")).strip()
+    if not name:
+        raise ModelManagerError("service add requires name=<服务名称>")
+
+    catalog = _load_catalog(context)
+    if catalog.resolve_service(name) is not None:
+        raise ModelManagerError(f"service already exists: {name}")
+    state = load_service_state()
+    existing_names = set(state["services"]) | set(state["removed"])
+    if any(existing.casefold() == name.casefold() for existing in existing_names):
+        raise ModelManagerError(
+            f"service already exists or is removed: {name}; use `service update` "
+            "or `service restore`"
+        )
+
+    raw = _service_raw_from_parameters(values, None, "service add")
+    if not _optional_string(raw.get("node")):
+        raise ModelManagerError("service add requires node=<节点名称>")
+    if not _optional_string(raw.get("container")) and not _optional_string(raw.get("url")):
+        raise ModelManagerError("service add requires container=<容器> or url=<URL>")
+    definition = _parse_service(name, raw)
+    _validate_service_definition(definition, context)
+
+    state["services"][definition.name] = raw
+    state["removed"] = [
+        existing
+        for existing in state["removed"]
+        if existing.casefold() != definition.name.casefold()
+    ]
+    save_service_state(state)
+    return definition.name, definition
+
+
+def _update_service(
+    parameters: Mapping[str, str],
+    context: ActionContext,
+) -> tuple[str, ServiceDefinition]:
+    values = dict(parameters)
+    name = str(values.pop("name", "")).strip()
+    if not name:
+        raise ModelManagerError("service update requires name=<服务名称>")
+    if not values:
+        raise ModelManagerError("service update requires at least one field to change")
+
+    catalog = _load_catalog(context)
+    current = catalog.resolve_service(name)
+    if current is None:
+        removed_catalog = _load_catalog(context, include_removed_services=True)
+        if removed_catalog.resolve_service(name) is not None:
+            raise ModelManagerError(f"service is removed; restore it first: {name}")
+        raise ModelManagerError(f"unknown service: {name}")
+
+    raw = _service_raw_from_parameters(
+        values,
+        _service_to_raw(current),
+        "service update",
+    )
+    definition = _parse_service(current.name, raw)
+    _validate_service_definition(
+        definition,
+        context,
+        previous_monitor_name=current.effective_monitor_name,
+    )
+
+    state = load_service_state()
+    state["services"][definition.name] = raw
+    save_service_state(state)
+    return definition.name, definition
+
+
+def _service_raw_from_parameters(
+    parameters: Mapping[str, str],
+    base: Mapping[str, Any] | None,
+    label: str,
+) -> dict[str, Any]:
+    values = dict(parameters)
+    raw: dict[str, Any] = dict(base or {})
+    string_fields = {"description", "node", "monitorName", "container", "url"}
+    value_fields = {
+        "expectedStatus",
+        "urlTimeoutSeconds",
+        "intervalSeconds",
+        "timeoutSeconds",
+        "severity",
+        "repeatAlertSeconds",
+        "notifyRecovery",
+        "enabled",
+    }
+    for key in string_fields:
+        if key in values:
+            raw[key] = str(values.pop(key)).strip()
+    for key in value_fields:
+        if key in values:
+            raw[key] = str(values.pop(key)).strip()
+    if values:
+        raise ModelManagerError(
+            f"unsupported service parameter(s): {', '.join(sorted(values))}"
+        )
+    return raw
+
+
+def _service_to_raw(service: ServiceDefinition) -> dict[str, Any]:
+    return {
+        "description": service.description,
+        "node": service.node,
+        "monitorName": service.effective_monitor_name,
+        "container": service.container,
+        "url": service.url,
+        "expectedStatus": service.expected_status,
+        "urlTimeoutSeconds": service.url_timeout_seconds,
+        "intervalSeconds": service.interval_seconds,
+        "timeoutSeconds": service.timeout_seconds,
+        "severity": service.severity,
+        "repeatAlertSeconds": service.repeat_alert_seconds,
+        "notifyRecovery": service.notify_recovery,
+        "enabled": service.enabled,
+    }
+
+
+def _validate_service_definition(
+    service: ServiceDefinition,
+    context: ActionContext,
+    *,
+    previous_monitor_name: str | None = None,
+) -> None:
+    nodes = context.require_service(NODES_SERVICE)
+    if nodes.resolve(service.node, context) is None:
+        raise ModelManagerError(f"unknown node: {service.node}")
+    existing_monitors = _all_alerts(context)
+    monitor_name = service.effective_monitor_name
+    if monitor_name in existing_monitors and monitor_name != previous_monitor_name:
+        raise ModelManagerError(f"monitor name already exists: {monitor_name}")
+
+
+def _manage_services(
+    action: str,
+    tokens: Sequence[str],
+    context: ActionContext,
+) -> str:
+    names = clean_names(tokens)
+    if not names:
+        raise ModelManagerError("please provide at least one service name")
+
+    state = load_service_state()
+    catalog = _load_catalog(context, include_removed_services=True)
+    removed = {name.casefold() for name in state["removed"]}
+    canonical_names: list[str] = []
+    for name in names:
+        service = catalog.resolve_service(name)
+        if service is None:
+            raise ModelManagerError(f"unknown service: {name}")
+        is_removed = service.name.casefold() in removed
+        if action == "移出" and is_removed:
+            raise ModelManagerError(f"service is already removed: {service.name}")
+        if action == "恢复" and not is_removed:
+            raise ModelManagerError(f"service is not removed: {service.name}")
+        canonical_names.append(service.name)
+
+    if action == "移出":
+        state["removed"] = sorted(set(state["removed"]) | set(canonical_names))
+    elif action == "恢复":
+        restored = {name.casefold() for name in canonical_names}
+        state["removed"] = [
+            name for name in state["removed"] if name.casefold() not in restored
+        ]
+    else:  # pragma: no cover - defensive
+        raise ModelManagerError(f"unsupported service operation: {action}")
+    save_service_state(state)
+    return _format_service_change(action, canonical_names)
+
+
+def _check_services(tokens: Sequence[str], context: ActionContext) -> str:
+    names = clean_names(tokens)
+    catalog = _load_catalog(context)
+    if names:
+        services: list[ServiceDefinition] = []
+        removed_catalog = _load_catalog(context, include_removed_services=True)
+        state = load_service_state()
+        removed = {name.casefold() for name in state["removed"]}
+        for name in names:
+            service = catalog.resolve_service(name)
+            if service is None:
+                removed_service = removed_catalog.resolve_service(name)
+                if (
+                    removed_service is not None
+                    and removed_service.name.casefold() in removed
+                ):
+                    raise ModelManagerError(
+                        f"service is removed; restore it first: {name}"
+                    )
+                raise ModelManagerError(f"unknown service: {name}")
+            services.append(service)
+    else:
+        services = list(catalog.services.values())
+    if not services:
+        return _format_service_help()
+    results = [
+        (service, SERVICE_MONITOR_PROVIDER.check({"service": service.name}, context))
+        for service in services
+    ]
+    return _format_service_checks(results)
+
+
 def _format_model_added(model: ModelDefinition) -> str:
     patterns = ", ".join(f"`{pattern}`" for pattern in model.alert_patterns)
     return "\n".join(
@@ -696,12 +1009,257 @@ def _format_model_error(message: str) -> str:
     )
 
 
+def _format_service_list(context: ActionContext) -> str:
+    catalog = _load_catalog(context, include_removed_services=True)
+    if not catalog.services:
+        return _format_service_help()
+    static_catalog = _load_catalog(context, include_dynamic=False)
+    state = load_service_state()
+    dynamic = {name.casefold() for name in state["services"]}
+    static = {name.casefold() for name in static_catalog.services}
+    removed = {name.casefold() for name in state["removed"]}
+    lines = [
+        "### 服务管理",
+        "",
+        "| 服务 | 节点 | 容器 | URL | 间隔 | 状态 | 来源 | 监控项 |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for service in sorted(catalog.services.values(), key=lambda item: item.name):
+        key = service.name.casefold()
+        if key in removed:
+            status = "已移出"
+        elif service.enabled:
+            status = "已启用"
+        else:
+            status = "已关闭"
+        if key in dynamic:
+            source = "动态覆盖" if key in static else "动态添加"
+        else:
+            source = "插件配置"
+        lines.append(
+            f"| `{service.name}` | `{service.node}` | "
+            f"{_inline_code(service.container)} | {_inline_code(service.url)} | "
+            f"{service.interval_seconds:g}s | {status} | {source} | "
+            f"`{service.effective_monitor_name}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "提示：`service remove` 保留定义，可用 `service restore` 恢复。",
+            "`service check` 立即验证；周期监控需重启 `monitor` 后加载。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_service_change(
+    action: str,
+    names: str | Sequence[str],
+    definition: ServiceDefinition | None = None,
+) -> str:
+    service_names = [names] if isinstance(names, str) else list(names)
+    lines = [
+        "### 服务管理",
+        "",
+        f"- 操作：**{action}**",
+        f"- 数量：**{len(service_names)}**",
+        f"- 服务：{', '.join(f'`{name}`' for name in service_names)}",
+    ]
+    if definition is not None:
+        targets: list[str] = []
+        if definition.container:
+            targets.append(f"容器 `{definition.container}`")
+        if definition.url:
+            targets.append(f"URL `{definition.url}`")
+        lines.extend(
+            [
+                f"- 节点：`{definition.node}`",
+                f"- 检查：{' + '.join(targets)}",
+                f"- 监控项：`{definition.effective_monitor_name}`",
+                f"- 间隔：**{definition.interval_seconds:g}s**",
+            ]
+        )
+    if action == "移出":
+        lines.append("- 恢复：发送 `service restore <名称>`")
+    lines.extend(
+        [
+            f"- 存储：已写入 `{service_state_file()}`。",
+            "- 验证：发送 `service check <名称>` 可立即检查。",
+            "- 生效：周期监控需重启 `monitor` 后加载。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_service_checks(
+    results: Sequence[tuple[ServiceDefinition, MonitorResult]],
+) -> str:
+    failed = sum(1 for _, result in results if not result.ok)
+    lines = [
+        "### 服务检查",
+        "",
+        f"- 总数：**{len(results)}**",
+        f"- 正常：**{len(results) - failed}**",
+        f"- 异常：**{failed}**",
+    ]
+    for service, result in results:
+        icon = "✅" if result.ok else "❌"
+        targets: list[str] = []
+        if service.container:
+            targets.append(f"container={service.container}")
+        if service.url:
+            targets.append(f"url={service.url}")
+        lines.extend(
+            [
+                "",
+                f"#### {icon} {service.name}",
+                "",
+                f"- 节点：`{service.node}`",
+                f"- 目标：{', '.join(targets)}",
+                f"- 结果：{result.message}",
+            ]
+        )
+        if result.details:
+            lines.extend(
+                [
+                    "",
+                    f"```text\n{_truncate_text(result.details, MAX_DETAILS_CHARS)}\n```",
+                ]
+            )
+    return "\n".join(lines)
+
+
+def _format_service_error(message: str) -> str:
+    return "\n".join(
+        [
+            "### 服务管理失败",
+            "",
+            f"- 原因：{message}",
+            "- 使用 `service help` 查看命令格式。",
+        ]
+    )
+
+
+def _format_service_help() -> str:
+    return "\n".join(
+        [
+            "### 服务管理",
+            "",
+            "- `service list`：查看服务、状态、来源和监控项",
+            "- `service add name=<名称> node=<节点> container=<容器>|url=<URL> [参数...]`：添加服务",
+            "- `service update name=<名称> [字段=值...]`：更新静态或动态服务",
+            "- `service remove <名称,...>`：移出服务，保留定义",
+            "- `service restore <名称,...>`：恢复已移出服务",
+            "- `service check [名称,...]`：立即检查服务",
+            "- `service help <子命令>`：查看参数和示例",
+            "",
+            "服务必须属于 nodes 插件中的节点；容器和 URL 至少配置一项。",
+        ]
+    )
+
+
+def _format_service_command_help(command: str) -> str | None:
+    if command in {"add", "create", "添加", "新增"}:
+        return "\n".join(
+            [
+                "### 命令：service add",
+                "",
+                "用法：`service add name=<名称> node=<节点> container=<容器>|url=<URL> [参数...]`",
+                "",
+                "必填：`name`、`node`，以及 `container` 或 `url` 至少一项。",
+                "可选：`description`、`monitorName`、`expectedStatus`、`urlTimeoutSeconds`、"
+                "`intervalSeconds`、`timeoutSeconds`、`severity`、`repeatAlertSeconds`、"
+                "`notifyRecovery`、`enabled`。",
+                f"- 动态配置保存到 `{service_state_file()}`。",
+                "- 服务名和监控名必须唯一，节点必须存在，URL 必须是绝对 HTTP(S) 地址。",
+                "",
+                "示例：`service add name=newapi-probe node=hangdian2-205 "
+                "url=http://127.0.0.1:3000/health expectedStatus=200 intervalSeconds=60`",
+            ]
+        )
+    if command in {"update", "edit", "修改", "更新"}:
+        return "\n".join(
+            [
+                "### 命令：service update",
+                "",
+                "用法：`service update name=<名称> [字段=值...]`",
+                "",
+                "只修改指定字段，其余字段保持不变。也可覆盖 `models.json` 中的静态服务。",
+                "可修改：`node`、`container`、`url`、`description`、`monitorName`、"
+                "`expectedStatus`、`urlTimeoutSeconds`、`intervalSeconds`、`timeoutSeconds`、"
+                "`severity`、`repeatAlertSeconds`、`notifyRecovery`、`enabled`。",
+                "",
+                "示例：`service update name=newapi-205 expectedStatus=204 intervalSeconds=120`",
+            ]
+        )
+    if command in {"remove", "delete", "rm", "移出", "移除", "删除"}:
+        return "\n".join(
+            [
+                "### 命令：service remove",
+                "",
+                "用法：`service remove <名称,...>`",
+                "",
+                "将服务移出活动列表；定义仍保留，可用 `service restore` 恢复。",
+                "示例：`service remove newapi-205`。",
+            ]
+        )
+    if command in {"restore", "恢复"}:
+        return "\n".join(
+            [
+                "### 命令：service restore",
+                "",
+                "用法：`service restore <名称,...>`",
+                "",
+                "恢复之前移出的服务，并重新生成对应监控项。",
+                "示例：`service restore newapi-205`。",
+            ]
+        )
+    if command in {"list", "ls", "状态", "列表"}:
+        return "\n".join(
+            [
+                "### 命令：service list",
+                "",
+                "列出服务、节点、容器、URL、间隔、状态、来源和监控项。",
+                "来源包括 `插件配置`、`动态添加`、`动态覆盖`。",
+                "",
+                "示例：`service list`。",
+            ]
+        )
+    if command in {"check", "status", "monitor", "检查"}:
+        return "\n".join(
+            [
+                "### 命令：service check",
+                "",
+                "用法：`service check [名称,...]`",
+                "",
+                "立即检查容器运行状态和 HTTP 状态码；省略名称时检查全部服务。",
+                "",
+                "示例：`service check newapi-205`、`service check newapi-205,redis-205`。",
+            ]
+        )
+    if command in {"help", "?", "/help", "帮助", "describe", "详情", "说明"}:
+        return "\n".join(
+            [
+                "### 命令：service help",
+                "",
+                "用法：`service help [子命令]`、`help service [子命令]`",
+                "",
+                "示例：`help service add`、`service help update`、`help service check`。",
+            ]
+        )
+    return None
+
+
 def _parse_alert_parameters(tokens: Sequence[str]) -> dict[str, str]:
     return _parse_key_value_parameters(tokens, "alert")
 
 
 def _parse_model_parameters(tokens: Sequence[str]) -> dict[str, str]:
     return _parse_key_value_parameters(tokens, "model")
+
+
+def _parse_service_parameters(tokens: Sequence[str]) -> dict[str, str]:
+    return _parse_key_value_parameters(tokens, "service")
 
 
 def _parse_key_value_parameters(tokens: Sequence[str], label: str) -> dict[str, str]:
@@ -851,8 +1409,8 @@ def _format_alert_help(detail: str | None = None) -> str:
             "示例：`alert add name=extra-vllm type=model-log model=vllm-31`",
         ],
         "node-service": [
-            "监控 `models.json` 的 `services` 中声明的节点容器和 HTTP 状态。",
-            "`service` 是 `services` 下的服务键，例如 `newapi-205`。",
+            "监控静态 `services` 或 `service add` 动态添加的节点容器和 HTTP 状态。",
+            "`service` 是服务键，例如 `newapi-205` 或 `redis-205`。",
             "必填：`service=<服务实例>`。",
             "示例：`alert add name=extra-service type=node-service service=newapi-205`",
         ],
@@ -908,6 +1466,151 @@ def _format_alert_help(detail: str | None = None) -> str:
     )
 
 
+def _format_model_command_help(command: str) -> str | None:
+    if command in {"add", "create", "添加", "新增"}:
+        return "\n".join(
+            [
+                "### 命令：model add",
+                "",
+                "用法：`model add name=<名称> node=<节点> logPath=<路径> "
+                "alertPatterns=<关键字,...> [参数...]`",
+                "",
+                "必填：`name`、`node`、`logPath`、`alertPatterns`。",
+                "可选：`description`、`monitorName`、`tailLines`、`intervalSeconds`、"
+                "`timeoutSeconds`、`severity`、`repeatAlertSeconds`、`notifyRecovery`、`enabled`。",
+                "- 模型名和监控名必须唯一，节点必须存在，日志路径必须是绝对路径。",
+                "- 多个告警关键字可用逗号分隔，也可传 JSON 数组。",
+                f"- 动态配置保存到 `{state_file()}`。",
+                "- `model check` 可立即验证；周期监控需重启 `monitor` 后加载。",
+                "",
+                "示例：`model add name=vllm-32 node=hangdian2-32 "
+                "logPath=/data/applogs/vllm.log alertPatterns='Shutting down'`",
+            ]
+        )
+    if command in {"list", "ls", "列表"}:
+        return "\n".join(
+            [
+                "### 命令：model list",
+                "",
+                "列出模型、节点、日志路径、告警关键字、监控项和配置来源。",
+                "来源分为 `插件配置` 和 `动态添加`；动态模型来自 `model add`。",
+                "",
+                "示例：`model list`。",
+            ]
+        )
+    if command in {"check", "status", "monitor", "检查", "状态"}:
+        return "\n".join(
+            [
+                "### 命令：model check",
+                "",
+                "用法：`model check [名称,...]`",
+                "",
+                "读取每个模型最近 `tailLines` 行日志，命中任一 `alertPatterns` 时返回异常。",
+                "省略名称时检查全部模型。",
+                "",
+                "示例：`model check vllm-27`、`model check vllm-27,vllm-31`。",
+            ]
+        )
+    if command in {"help", "?", "/help", "帮助"}:
+        return "\n".join(
+            [
+                "### 命令：model help",
+                "",
+                "用法：`model help [子命令]`、`help model [子命令]`",
+                "",
+                "示例：`help model add`、`help model check`、`help alert add model-log`。",
+            ]
+        )
+    return None
+
+
+def _format_alert_command_help(command: str, detail: str | None = None) -> str:
+    if command in {"add", "create", "添加", "新增"}:
+        if detail:
+            return _format_alert_help(detail)
+        return "\n".join(
+            [
+                "### 命令：alert add",
+                "",
+                "用法：`alert add name=<名称> type=<类型> [参数...]`",
+                "",
+                "支持类型：`model-log`、`node-service`、`http`、`tcp`、`command`。",
+                "通用可选参数：`intervalSeconds`、`timeoutSeconds`、`severity`、"
+                "`repeatAlertSeconds`、`notifyRecovery`、`enabled`、`description`。",
+                "",
+                "使用 `alert help <类型>` 查看该类型的必填参数。",
+                "示例：`alert add name=api-health type=http url=http://127.0.0.1:8080/health`",
+            ]
+        )
+    if command in {"list", "ls", "状态", "列表"}:
+        return "\n".join(
+            [
+                "### 命令：alert list",
+                "",
+                "列出告警项的类型、级别、间隔、状态和来源。",
+                "状态包括已启用、已关闭和已移出。",
+                "",
+                "示例：`alert list`。",
+            ]
+        )
+    if command in {"disable", "off", "关闭", "停用"}:
+        return "\n".join(
+            [
+                "### 命令：alert disable",
+                "",
+                "用法：`alert disable <名称,...>`",
+                "",
+                "保留告警定义但停止调度；可用 `alert enable` 恢复。",
+                "示例：`alert disable vllm-shared-memory-27,newapi-status-205`。",
+            ]
+        )
+    if command in {"enable", "on", "启用", "开启"}:
+        return "\n".join(
+            [
+                "### 命令：alert enable",
+                "",
+                "用法：`alert enable <名称,...>`",
+                "",
+                "重新启用之前被关闭的告警项；已移出的告警需先恢复。",
+                "示例：`alert enable vllm-shared-memory-27`。",
+            ]
+        )
+    if command in {"remove", "delete", "rm", "移出", "移除", "删除"}:
+        return "\n".join(
+            [
+                "### 命令：alert remove",
+                "",
+                "用法：`alert remove <名称,...>`",
+                "",
+                "将告警项移出活动列表；定义仍保留，可用 `alert restore` 恢复。",
+                "示例：`alert remove newapi-status-205`。",
+            ]
+        )
+    if command in {"restore", "恢复"}:
+        return "\n".join(
+            [
+                "### 命令：alert restore",
+                "",
+                "用法：`alert restore <名称,...>`",
+                "",
+                "恢复之前被移出的告警项，并按原配置重新启用。",
+                "示例：`alert restore newapi-status-205`。",
+            ]
+        )
+    if command in {"help", "?", "/help", "帮助", "describe", "详情", "说明"}:
+        return "\n".join(
+            [
+                "### 命令：alert help",
+                "",
+                "用法：`alert help [类型|子命令]`、`help alert [类型|子命令]`",
+                "",
+                "示例：`alert help model-log`、`help alert add model-log`、"
+                "`help alert disable`。",
+            ]
+        )
+    return _format_alert_help()
+
+
 def _format_alert_error(message: str) -> str:
     return "\n".join(
         [
@@ -923,6 +1626,7 @@ def _load_catalog(
     context: ActionContext | None = None,
     *,
     include_dynamic: bool = True,
+    include_removed_services: bool = False,
 ) -> ModelCatalog:
     source = _config_file()
     if source.is_file():
@@ -961,6 +1665,31 @@ def _load_catalog(
                     f"dynamic model {name!r} conflicts with static model config"
                 )
             models[name] = _parse_model(name, item)
+        try:
+            service_state = load_service_state()
+        except ServiceStateError as exc:
+            raise ModelManagerError(str(exc)) from exc
+        for name, item in service_state["services"].items():
+            duplicate = next(
+                (
+                    existing
+                    for existing in services
+                    if existing != name and existing.casefold() == name.casefold()
+                ),
+                None,
+            )
+            if duplicate is not None:
+                raise ModelManagerError(
+                    f"dynamic service {name!r} conflicts with service {duplicate!r}"
+                )
+            services[name] = _parse_service(name, item)
+        if not include_removed_services:
+            removed = {name.casefold() for name in service_state["removed"]}
+            services = {
+                name: service
+                for name, service in services.items()
+                if name.casefold() not in removed
+            }
     return ModelCatalog(models=models, services=services)
 
 
@@ -1290,6 +2019,7 @@ def _format_help(catalog: ModelCatalog) -> str:
                 "尚未配置模型。可填写 `config/models.json`、设置 `MODEL_MANAGER_CONFIG`，或发送 `model add`。",
                 "- `model add name=<名称> node=<节点> logPath=<路径> alertPatterns=<关键字>`：添加模型",
                 "- `alert help`：查看告警管理命令",
+                "- `service help`：查看服务管理命令",
             ]
         )
     names = ", ".join(f"`{name}`" for name in sorted(catalog.models))
@@ -1304,6 +2034,9 @@ def _format_help(catalog: ModelCatalog) -> str:
             "- `alert list`：查看告警项状态",
             "- `alert disable|enable|remove|restore <名称,...>`：管理告警项",
             "- `alert add name=<名称> type=<类型> [参数...]`：添加告警项",
+            "- `service list`：查看节点服务监控",
+            "- `service add|update|remove|restore`：管理服务定义",
+            "- `service check [名称,...]`：立即检查服务",
             "",
             "模型日志和服务健康异常会由插件声明的监控项上报钉钉 Webhook。",
         ]

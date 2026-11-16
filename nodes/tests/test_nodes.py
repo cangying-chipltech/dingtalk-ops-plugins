@@ -262,6 +262,23 @@ class NodePluginTests(unittest.TestCase):
         output = format_help(catalog)
         self.assertIn("**插件命令**", output)
         self.assertIn("节点插件中的节点", output)
+        self.assertIn("**插件帮助**", output)
+        self.assertIn("`help node`", output)
+        self.assertIn("`node help`", output)
+
+    def test_help_routes_nodes_topics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            actions_path = Path(tmp) / "actions.json"
+            actions_path.write_text(
+                json.dumps({"actions": {"hello": {"command": ["true"]}}}),
+                encoding="utf-8",
+            )
+            catalog = load_action_catalog(actions_path, registry=self.registry)
+        for prompt in ("help nodes", "help nodes list", "node help"):
+            output = handle_prompt(prompt, catalog)
+            self.assertIn("nodes 插件", output)
+            self.assertIn("node-login", output)
+            self.assertIn("node-health", output)
 
     def test_plugin_contributes_node_actions_and_batch(self):
         with tempfile.TemporaryDirectory() as tmp:

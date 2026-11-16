@@ -64,6 +64,9 @@ swe-runner recent
 69 status
 10.0.10.69 history
 swe-runner help
+swe-runner help status
+swe-runner help 69
+help swe-runner status
 ```
 
 插件命令应带 `swe-runner` 前缀；裸 `status`、`check` 始终由框架执行监控检查。若插件

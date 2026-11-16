@@ -176,7 +176,7 @@ class SweRunnerCommandProvider:
 
         catalog = _load_catalog(context)
         if forced and command in HELP_COMMANDS:
-            return _format_help(catalog)
+            return self.help(f"swe-runner {text}".strip(), context) or _format_help(catalog)
         target = catalog.resolve(first)
         if target is not None:
             return _handle_target(target, rest, catalog, context)
@@ -198,6 +198,26 @@ class SweRunnerCommandProvider:
             return _run_status(default, True, catalog.settings, context)
         if forced:
             return _format_help(catalog)
+        return None
+
+    def help(self, topic: str, context: ActionContext) -> str | None:
+        text = (topic or "").strip()
+        catalog = _load_catalog(context)
+        parts = text.split()
+        if parts and parts[0].casefold() == "swe-runner":
+            parts = parts[1:]
+        if not parts:
+            return _format_help(catalog)
+        if parts[0].casefold() in HELP_COMMANDS:
+            parts = parts[1:]
+            if not parts:
+                return _format_help(catalog)
+        command = parts[0].casefold()
+        if command in STATUS_COMMANDS or command in HISTORY_COMMANDS:
+            return _format_swe_help(catalog)
+        target = catalog.resolve(parts[0])
+        if target is not None:
+            return _format_target_help(target)
         return None
 
     def help_lines(self) -> Sequence[str]:
@@ -455,6 +475,40 @@ def _format_help(catalog: SweRunnerCatalog) -> str:
             "",
             "别名：" if aliases else "别名：-",
             *aliases,
+        ]
+    )
+
+
+def _format_swe_help(catalog: SweRunnerCatalog) -> str:
+    targets = ", ".join(f"`{name}`" for name in sorted(catalog.targets)) or "-"
+    return "\n".join(
+        [
+            "### swe-runner 插件",
+            "",
+            "- `swe-runner status`：查询默认目标实时状态",
+            "- `swe-runner history`：查询默认目标历史状态",
+            "- `swe-runner <目标> status|history`：查询指定目标",
+            "- `<目标> status|history`：兼容旧 bridge 的写法",
+            "- `swe-runner help [目标]`：查看插件或目标帮助",
+            "",
+            f"- 默认目标：`{catalog.default or '-'}`",
+            f"- 已配置目标：{targets}",
+        ]
+    )
+
+
+def _format_target_help(target: SweTarget) -> str:
+    aliases = ", ".join(f"`{alias}`" for alias in target.aliases) or "-"
+    location = target.node or target.host or "-"
+    return "\n".join(
+        [
+            f"### swe-runner 目标：{target.name}",
+            "",
+            f"- 节点/主机：`{location}`",
+            f"- 队列：`{target.queue}`",
+            f"- 别名：{aliases}",
+            "",
+            f"示例：`swe-runner {target.name} status`、`swe-runner {target.name} history`。",
         ]
     )
 

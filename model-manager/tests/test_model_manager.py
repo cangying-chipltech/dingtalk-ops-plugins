@@ -48,6 +48,7 @@ class ModelManagerPluginTests(unittest.TestCase):
         self.config = self.root / "models.json"
         self.alert_state = self.root / "alert-management.json"
         self.model_state = self.root / "model-state.json"
+        self.service_state = self.root / "service-state.json"
         self.nodes = FakeNodes()
         self.context = ActionContext(services={"nodes": self.nodes})
         self.state_env = mock.patch.dict(
@@ -55,6 +56,7 @@ class ModelManagerPluginTests(unittest.TestCase):
             {
                 "MODEL_MANAGER_ALERT_STATE_FILE": str(self.alert_state),
                 "MODEL_MANAGER_MODEL_STATE_FILE": str(self.model_state),
+                "MODEL_MANAGER_SERVICE_STATE_FILE": str(self.service_state),
             },
         )
         self.state_env.start()
@@ -267,6 +269,177 @@ class ModelManagerPluginTests(unittest.TestCase):
             with self.assertRaisesRegex(ActionValidationError, "unknown node"):
                 self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
 
+    def test_service_add_persists_definition_and_generates_monitor(self):
+        command = (
+            "service add name=redis-205 node=web-01 container=redis "
+            "url=http://127.0.0.1:6379/health expectedStatus=204 "
+            "intervalSeconds=30 severity=warning description='205 Redis 健康检查'"
+        )
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            output = self.plugin.COMMAND_PROVIDER.handle(command, self.context)
+            listed = self.plugin.COMMAND_PROVIDER.handle(
+                "service list", self.context
+            )
+            monitors = self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
+            with mock.patch.object(self.plugin, "_run_process") as run:
+                run.return_value = self.plugin._ProcessResult(0, "", "", False, 8)
+                checked = self.plugin.COMMAND_PROVIDER.handle(
+                    "service check redis-205", self.context
+                )
+
+        self.assertIn("服务管理", output)
+        self.assertIn("添加", output)
+        self.assertIn("model-manager-redis-205-service", output)
+        self.assertIn(str(self.service_state), output)
+        self.assertIn("重启 `monitor`", output)
+        self.assertIn("redis-205", listed)
+        self.assertIn("动态添加", listed)
+        monitor = monitors["model-manager-redis-205-service"]
+        self.assertEqual(monitor["check"], {"type": "node-service", "service": "redis-205"})
+        self.assertEqual(monitor["intervalSeconds"], 30.0)
+        self.assertEqual(monitor["severity"], "warning")
+        self.assertIn("服务检查", checked)
+        self.assertIn("正常：**1**", checked)
+        state = json.loads(self.service_state.read_text(encoding="utf-8"))
+        self.assertEqual(state["services"]["redis-205"]["expectedStatus"], "204")
+        self.assertEqual(state["services"]["redis-205"]["container"], "redis")
+
+    def test_service_update_overrides_static_and_preserves_unspecified_fields(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            static_update = self.plugin.COMMAND_PROVIDER.handle(
+                "service update name=newapi-205 "
+                "url=http://127.0.0.1:3000/health expectedStatus=204 "
+                "intervalSeconds=120",
+                self.context,
+            )
+            self.plugin.COMMAND_PROVIDER.handle(
+                "service add name=redis-205 node=web-01 container=redis "
+                "intervalSeconds=30",
+                self.context,
+            )
+            dynamic_update = self.plugin.COMMAND_PROVIDER.handle(
+                "service update name=redis-205 intervalSeconds=90 severity=warning",
+                self.context,
+            )
+            listed = self.plugin.COMMAND_PROVIDER.handle(
+                "service list", self.context
+            )
+            with mock.patch.object(self.plugin, "_run_process") as run:
+                run.return_value = self.plugin._ProcessResult(0, "", "", False, 8)
+                result = self.plugin.SERVICE_MONITOR_PROVIDER.check(
+                    {"service": "newapi-205"}, self.context
+                )
+
+        self.assertIn("更新", static_update)
+        self.assertIn("更新", dynamic_update)
+        self.assertIn("动态覆盖", listed)
+        self.assertIn("动态添加", listed)
+        self.assertIn("http://127.0.0.1:3000/health", self.nodes.last_remote)
+        self.assertIn("!= 204", self.nodes.last_remote)
+        self.assertTrue(result.ok)
+        state = json.loads(self.service_state.read_text(encoding="utf-8"))
+        self.assertEqual(state["services"]["newapi-205"]["container"], "new-api")
+        self.assertEqual(
+            state["services"]["newapi-205"]["url"],
+            "http://127.0.0.1:3000/health",
+        )
+        self.assertEqual(state["services"]["redis-205"]["container"], "redis")
+        self.assertEqual(state["services"]["redis-205"]["intervalSeconds"], "90")
+        self.assertEqual(state["services"]["redis-205"]["severity"], "warning")
+
+    def test_service_remove_and_restore_control_monitor_and_check(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            removed = self.plugin.COMMAND_PROVIDER.handle(
+                "service remove newapi-205", self.context
+            )
+            listed = self.plugin.COMMAND_PROVIDER.handle(
+                "service list", self.context
+            )
+            monitors = self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
+            check = self.plugin.COMMAND_PROVIDER.handle(
+                "service check newapi-205", self.context
+            )
+            state_after_remove = json.loads(
+                self.service_state.read_text(encoding="utf-8")
+            )
+            restored = self.plugin.COMMAND_PROVIDER.handle(
+                "service restore newapi-205", self.context
+            )
+            restored_monitors = self.plugin.SERVICE_MONITOR_PROVIDER.monitors(
+                self.context
+            )
+
+        self.assertIn("移出", removed)
+        self.assertIn("已移出", listed)
+        self.assertNotIn("newapi-status-205", monitors)
+        self.assertIn("restore it first", check)
+        self.assertEqual(state_after_remove["removed"], ["newapi-205"])
+        self.assertIn("恢复", restored)
+        self.assertIn("newapi-status-205", restored_monitors)
+        state = json.loads(self.service_state.read_text(encoding="utf-8"))
+        self.assertEqual(state["removed"], [])
+
+    def test_service_add_validates_fields_duplicates_and_monitor_conflicts(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            cases = [
+                ("service add", "name=<服务名称>"),
+                ("service add name=probe", "node=<节点名称>"),
+                ("service add name=probe node=web-01", "container=<容器> or url=<URL>"),
+                (
+                    "service add name=probe node=missing url=http://127.0.0.1/health",
+                    "unknown node",
+                ),
+                (
+                    "service add name=newapi-205 node=web-01 "
+                    "url=http://127.0.0.1/health",
+                    "already exists",
+                ),
+                (
+                    "service add name=probe node=web-01 "
+                    "url=http://127.0.0.1/health monitorName=newapi-status-205",
+                    "monitor name already exists",
+                ),
+                (
+                    "service add name=probe node=web-01 url=127.0.0.1/health",
+                    "absolute HTTP(S)",
+                ),
+                (
+                    "service add name=probe node=web-01 "
+                    "url=http://127.0.0.1/health logPath=/tmp/app.log",
+                    "unsupported service parameter",
+                ),
+            ]
+            for command, expected in cases:
+                with self.subTest(command=command):
+                    output = self.plugin.COMMAND_PROVIDER.handle(command, self.context)
+                    self.assertIn("服务管理失败", output)
+                    self.assertIn(expected, output)
+
+        self.assertFalse(self.service_state.exists())
+
+    def test_dynamic_service_can_back_node_service_alert_and_help(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            self.plugin.COMMAND_PROVIDER.handle(
+                "service add name=redis-205 node=web-01 container=redis "
+                "intervalSeconds=30",
+                self.context,
+            )
+            alert_output = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=redis-copy type=node-service service=redis-205",
+                self.context,
+            )
+            service_help = self.plugin.COMMAND_PROVIDER.help(
+                "service add", self.context
+            )
+            service_help_command = self.plugin.COMMAND_PROVIDER.handle(
+                "service help update", self.context
+            )
+
+        self.assertIn("添加", alert_output)
+        self.assertIn("命令：service add", service_help)
+        self.assertIn("container=<容器>|url=<URL>", service_help)
+        self.assertIn("命令：service update", service_help_command)
+
     def test_alert_disable_enable_remove_restore_and_add(self):
         with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
             output = self.plugin.COMMAND_PROVIDER.handle(
@@ -432,6 +605,31 @@ class ModelManagerPluginTests(unittest.TestCase):
         self.assertIn("model=<模型实例>", model_help)
         self.assertIn("url=<http(s)://地址>", http_help)
         self.assertIn("unknown alert type", unknown)
+
+    def test_help_supports_model_and_alert_topics(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            model_add = self.plugin.COMMAND_PROVIDER.help("model add", self.context)
+            model_add_command = self.plugin.COMMAND_PROVIDER.handle(
+                "model help add", self.context
+            )
+            alert_add = self.plugin.COMMAND_PROVIDER.help(
+                "alert add model-log", self.context
+            )
+            alert_add_command = self.plugin.COMMAND_PROVIDER.handle(
+                "alert help add", self.context
+            )
+            alert_disable = self.plugin.COMMAND_PROVIDER.help(
+                "alert disable", self.context
+            )
+
+        self.assertIn("命令：model add", model_add)
+        self.assertIn("必填", model_add)
+        self.assertIn("可选", model_add)
+        self.assertIn("命令：model add", model_add_command)
+        self.assertIn("告警类型：model-log", alert_add)
+        self.assertIn("model=<模型实例>", alert_add)
+        self.assertIn("命令：alert add", alert_add_command)
+        self.assertIn("命令：alert disable", alert_disable)
 
     def test_service_check_reports_healthy_container_and_http_endpoint(self):
         with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):

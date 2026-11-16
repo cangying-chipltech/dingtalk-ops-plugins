@@ -266,7 +266,23 @@ class SweRunnerPluginTests(unittest.TestCase):
         output = format_help(catalog)
         self.assertIn("**插件命令**", output)
         self.assertIn("`swe-runner status|query|s|q`", output)
+        self.assertIn("**插件帮助**", output)
+        self.assertIn("`help swe-runner`", output)
+        self.assertIn("`swe-runner help`", output)
         self.assertIn("- `status`：立即执行全部已启用监控", output)
+
+    def test_help_routes_swe_runner_topics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            swe_config = self._write_config(root)
+            catalog = load_action_catalog(self._write_actions(root), registry=self.registry)
+            with mock.patch.dict(os.environ, {"SWE_RUNNER_CONFIG": str(swe_config)}):
+                status_help = handle_prompt("help swe-runner status", catalog)
+                target_help = handle_prompt("help swe-runner 69", catalog)
+                plugin_help = handle_prompt("swe-runner help status", catalog)
+        self.assertIn("swe-runner status", status_help)
+        self.assertIn("swe-runner 目标：69", target_help)
+        self.assertIn("swe-runner status", plugin_help)
 
     def _write_config(self, root: Path) -> Path:
         path = root / "swe-runner.json"

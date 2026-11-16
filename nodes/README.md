@@ -71,6 +71,8 @@ mv data/secrets/web-01.password.tmp data/secrets/web-01.password
 nodes
 node list
 节点
+node help
+help nodes
 ```
 
 命令只显示节点名称、主机、用户、端口和认证方式，不显示密码变量值。

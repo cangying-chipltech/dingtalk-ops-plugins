@@ -23,6 +23,7 @@ ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 STRICT_HOST_KEY_VALUES = {"yes", "no", "accept-new"}
 NODE_COMMANDS = {"nodes", "node", "节点"}
 LIST_COMMANDS = {"list", "列表"}
+HELP_COMMANDS = {"help", "?", "/help", "h", "帮助"}
 
 
 class NodePluginError(ActionValidationError):
@@ -209,14 +210,44 @@ class NodeCommandProvider:
             return None
         rest = parts[1].strip() if len(parts) > 1 else ""
         tokens = rest.split(maxsplit=1)
+        if tokens and tokens[0].lower() in HELP_COMMANDS:
+            return self.help(text, context) or _format_help()
         if tokens and tokens[0].lower() not in LIST_COMMANDS:
             raise NodePluginError("节点命令格式为 `nodes`、`node list` 或 `节点`。")
         return _format_node_list(SERVICE.list_nodes(context))
+
+    def help(self, topic: str, context: ActionContext) -> str | None:
+        text = (topic or "").strip()
+        if not text:
+            return _format_help()
+        parts = text.split()
+        if parts[0].casefold() in NODE_COMMANDS:
+            parts = parts[1:]
+        if not parts or parts[0].casefold() in LIST_COMMANDS | HELP_COMMANDS:
+            return _format_help()
+        return None
 
     def help_lines(self) -> Sequence[str]:
         return (
             "- `nodes` / `node list` / `节点`：列出节点插件中的节点，不显示密码",
         )
+
+
+def _format_help() -> str:
+    return "\n".join(
+        [
+            "### nodes 插件",
+            "",
+            "- `nodes` / `node list` / `节点`：列出节点，不显示密码",
+            "- `node help`：显示本帮助",
+            "- `run node-login node=<节点>`：验证 SSH 登录",
+            "- `run node-info node=<节点>`：查看主机名、运行时间和用户",
+            "- `run node-disk node=<节点>`：查看磁盘使用",
+            "- `batch node-health node=<节点>`：并发执行节点健康检查",
+            "",
+            "节点配置默认读取 `plugins/nodes/config/nodes.json`。",
+        ]
+    )
 
 
 def _config_path(context: ActionContext) -> Path:
