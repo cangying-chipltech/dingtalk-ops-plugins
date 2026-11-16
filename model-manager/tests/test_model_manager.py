@@ -46,8 +46,19 @@ class ModelManagerPluginTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.config = self.root / "models.json"
+        self.alert_state = self.root / "alert-management.json"
+        self.model_state = self.root / "model-state.json"
         self.nodes = FakeNodes()
         self.context = ActionContext(services={"nodes": self.nodes})
+        self.state_env = mock.patch.dict(
+            os.environ,
+            {
+                "MODEL_MANAGER_ALERT_STATE_FILE": str(self.alert_state),
+                "MODEL_MANAGER_MODEL_STATE_FILE": str(self.model_state),
+            },
+        )
+        self.state_env.start()
+        self.addCleanup(self.state_env.stop)
         self.config.write_text(
             json.dumps(
                 {
@@ -131,6 +142,113 @@ class ModelManagerPluginTests(unittest.TestCase):
         self.assertIn("newapi-205", output)
         self.assertIn("newapi-status-205", output)
 
+    def test_model_add_persists_dynamic_model_and_generates_monitor(self):
+        command = (
+            "model add name=vllm-32 node=web-01 "
+            "logPath=/data/applogs/vllm.log "
+            "alertPatterns='Shutting down,No available shared memory broadcast' "
+            "description='32 节点 vLLM 日志' intervalSeconds=30 timeoutSeconds=9 "
+            "severity=warning repeatAlertSeconds=120 notifyRecovery=false"
+        )
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            output = self.plugin.COMMAND_PROVIDER.handle(command, self.context)
+            listed = self.plugin.COMMAND_PROVIDER.handle("model list", self.context)
+            monitors = self.plugin.MONITOR_PROVIDER.monitors(self.context)
+            with mock.patch.object(self.plugin, "_run_process") as run:
+                run.return_value = self.plugin._ProcessResult(0, "", "", False, 8)
+                result = self.plugin.MONITOR_PROVIDER.check(
+                    {"model": "vllm-32"}, self.context
+                )
+
+        self.assertIn("模型添加", output)
+        self.assertIn("model-manager-vllm-32-log", output)
+        self.assertIn(str(self.model_state), output)
+        self.assertIn("重启 `monitor`", output)
+        self.assertIn("vllm-32", listed)
+        self.assertIn("动态添加", listed)
+        monitor = monitors["model-manager-vllm-32-log"]
+        self.assertEqual(monitor["check"], {"type": "model-log", "model": "vllm-32"})
+        self.assertEqual(monitor["intervalSeconds"], 30.0)
+        self.assertEqual(monitor["timeoutSeconds"], 9.0)
+        self.assertEqual(monitor["severity"], "warning")
+        self.assertEqual(monitor["repeatAlertSeconds"], 120.0)
+        self.assertFalse(monitor["notifyRecovery"])
+        self.assertTrue(result.ok)
+        self.assertIn("tail -n 10", self.nodes.last_remote)
+        self.assertIn("Shutting down", self.nodes.last_remote)
+
+        state = json.loads(self.model_state.read_text(encoding="utf-8"))
+        self.assertEqual(state["version"], 1)
+        entry = state["models"]["vllm-32"]
+        self.assertEqual(entry["node"], "web-01")
+        self.assertEqual(entry["logPath"], "/data/applogs/vllm.log")
+        self.assertEqual(
+            entry["alertPatterns"],
+            ["Shutting down", "No available shared memory broadcast"],
+        )
+        self.assertEqual(entry["intervalSeconds"], 30.0)
+        self.assertEqual(entry["severity"], "warning")
+        self.assertFalse(entry["notifyRecovery"])
+
+    def test_model_add_rejects_duplicate_names_and_monitor_conflicts(self):
+        base = "node=web-01 logPath=/data/applogs/vllm.log alertPatterns='Shutting down'"
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            static_duplicate = self.plugin.COMMAND_PROVIDER.handle(
+                f"model add name=vllm-27 {base}", self.context
+            )
+            added = self.plugin.COMMAND_PROVIDER.handle(
+                f"model add name=vllm-32 {base}", self.context
+            )
+            dynamic_duplicate = self.plugin.COMMAND_PROVIDER.handle(
+                f"model add name=vllm-32 {base}", self.context
+            )
+            casefold_duplicate = self.plugin.COMMAND_PROVIDER.handle(
+                f"model add name=VLLM-32 {base}", self.context
+            )
+            model_monitor_conflict = self.plugin.COMMAND_PROVIDER.handle(
+                f"model add name=vllm-33 {base} "
+                "monitorName=vllm-shared-memory-27",
+                self.context,
+            )
+            service_monitor_conflict = self.plugin.COMMAND_PROVIDER.handle(
+                f"model add name=vllm-34 {base} monitorName=newapi-status-205",
+                self.context,
+            )
+
+        self.assertIn("already exists", static_duplicate)
+        self.assertIn("模型添加", added)
+        self.assertIn("already exists", dynamic_duplicate)
+        self.assertIn("already exists", casefold_duplicate)
+        self.assertIn("monitor name already exists", model_monitor_conflict)
+        self.assertIn("monitor name already exists", service_monitor_conflict)
+        state = json.loads(self.model_state.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(state["models"]), ["vllm-32"])
+
+    def test_model_add_validates_required_fields_and_node(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            cases = [
+                ("model add", "name=<模型实例>"),
+                ("model add name=vllm-32", "node=<节点名称>"),
+                ("model add name=vllm-32 node=web-01", "logPath=<日志路径>"),
+                (
+                    "model add name=vllm-32 node=web-01 "
+                    "logPath=/data/applogs/vllm.log",
+                    "alertPatterns=<关键字,...>",
+                ),
+                (
+                    "model add name=vllm-32 node=missing "
+                    "logPath=/data/applogs/vllm.log alertPatterns=boom",
+                    "unknown node",
+                ),
+            ]
+            for command, expected in cases:
+                with self.subTest(command=command):
+                    output = self.plugin.COMMAND_PROVIDER.handle(command, self.context)
+                    self.assertIn("模型添加失败", output)
+                    self.assertIn(expected, output)
+
+        self.assertFalse(self.model_state.exists())
+
     def test_service_monitor_definitions_are_generated_from_config(self):
         with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
             monitors = self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
@@ -148,6 +266,172 @@ class ModelManagerPluginTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
             with self.assertRaisesRegex(ActionValidationError, "unknown node"):
                 self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)
+
+    def test_alert_disable_enable_remove_restore_and_add(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            output = self.plugin.COMMAND_PROVIDER.handle(
+                "alert disable vllm-shared-memory-27,newapi-status-205",
+                self.context,
+            )
+            self.assertIn("关闭", output)
+            self.assertFalse(
+                self.plugin.MONITOR_PROVIDER.monitors(self.context)[
+                    "vllm-shared-memory-27"
+                ]["enabled"]
+            )
+            self.assertFalse(
+                self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context)[
+                    "newapi-status-205"
+                ]["enabled"]
+            )
+
+            self.assertIn(
+                "启用",
+                self.plugin.COMMAND_PROVIDER.handle(
+                    "alert enable vllm-shared-memory-27,newapi-status-205",
+                    self.context,
+                ),
+            )
+            self.assertTrue(
+                self.plugin.MONITOR_PROVIDER.monitors(self.context)[
+                    "vllm-shared-memory-27"
+                ]["enabled"]
+            )
+
+            self.plugin.COMMAND_PROVIDER.handle(
+                "alert remove vllm-shared-memory-27", self.context
+            )
+            self.assertNotIn(
+                "vllm-shared-memory-27",
+                self.plugin.MONITOR_PROVIDER.monitors(self.context),
+            )
+            self.plugin.COMMAND_PROVIDER.handle(
+                "alert restore vllm-shared-memory-27", self.context
+            )
+            self.assertIn(
+                "vllm-shared-memory-27",
+                self.plugin.MONITOR_PROVIDER.monitors(self.context),
+            )
+
+            added = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=vllm-31-copy type=model-log model=vllm-27 "
+                "intervalSeconds=30 severity=warning",
+                self.context,
+            )
+            self.assertIn("添加", added)
+            monitors = self.plugin.MONITOR_PROVIDER.monitors(self.context)
+            self.assertIn("vllm-31-copy", monitors)
+            self.assertEqual(monitors["vllm-31-copy"]["check"]["model"], "vllm-27")
+            self.assertEqual(monitors["vllm-31-copy"]["intervalSeconds"], 30.0)
+            self.assertEqual(monitors["vllm-31-copy"]["severity"], "warning")
+
+            http_output = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=api-health type=http "
+                "url=http://127.0.0.1:8080/health expectedStatus=200,204",
+                self.context,
+            )
+            self.assertIn("添加", http_output)
+            http_monitor = self.plugin.MONITOR_PROVIDER.monitors(self.context)[
+                "api-health"
+            ]
+            self.assertEqual(http_monitor["check"]["type"], "http")
+            self.assertEqual(http_monitor["check"]["expectedStatus"], [200, 204])
+
+            service_output = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=service-copy type=node-service service=newapi-205",
+                self.context,
+            )
+            self.assertIn("添加", service_output)
+            self.assertIn(
+                "service-copy",
+                self.plugin.SERVICE_MONITOR_PROVIDER.monitors(self.context),
+            )
+
+            command_output = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=host-ready type=command command=hostname "
+                "stdoutContains=worker",
+                self.context,
+            )
+            self.assertIn("添加", command_output)
+            command_monitor = self.plugin.MONITOR_PROVIDER.monitors(self.context)[
+                "host-ready"
+            ]
+            self.assertEqual(command_monitor["check"]["command"], ["hostname"])
+
+            self.plugin.COMMAND_PROVIDER.handle("alert remove api-health", self.context)
+            self.assertNotIn(
+                "api-health", self.plugin.MONITOR_PROVIDER.monitors(self.context)
+            )
+            self.plugin.COMMAND_PROVIDER.handle("alert restore api-health", self.context)
+            self.assertIn(
+                "api-health", self.plugin.MONITOR_PROVIDER.monitors(self.context)
+            )
+
+        state = json.loads(self.alert_state.read_text(encoding="utf-8"))
+        self.assertIn("vllm-31-copy", state["added"])
+        self.assertIn("api-health", state["added"])
+
+    def test_alert_add_rejects_duplicates_and_invalid_types(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            duplicate = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=vllm-shared-memory-27 type=model-log model=vllm-27",
+                self.context,
+            )
+            self.assertIn("already exists", duplicate)
+
+            self.plugin.COMMAND_PROVIDER.handle(
+                "alert remove vllm-shared-memory-27", self.context
+            )
+            removed = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=vllm-shared-memory-27 type=model-log model=vllm-27",
+                self.context,
+            )
+            self.assertIn("restore it first", removed)
+
+            missing_type = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=missing", self.context
+            )
+            self.assertIn("requires type", missing_type)
+            invalid_type = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=bad type=unknown", self.context
+            )
+            self.assertIn("type must be one of", invalid_type)
+            unknown_model = self.plugin.COMMAND_PROVIDER.handle(
+                "alert add name=bad type=model-log model=missing", self.context
+            )
+            self.assertIn("unknown model", unknown_model)
+
+    def test_alert_list_shows_management_status(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            self.plugin.COMMAND_PROVIDER.handle(
+                "alert disable vllm-shared-memory-27", self.context
+            )
+            output = self.plugin.COMMAND_PROVIDER.handle("alert list", self.context)
+        self.assertIn("vllm-shared-memory-27", output)
+        self.assertIn("已关闭", output)
+        self.assertIn("插件配置", output)
+        self.assertIn("重启 `monitor`", output)
+
+    def test_alert_help_describes_type_parameters(self):
+        with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):
+            summary = self.plugin.COMMAND_PROVIDER.handle(
+                "alert help", self.context
+            )
+            model_help = self.plugin.COMMAND_PROVIDER.handle(
+                "alert help model-log", self.context
+            )
+            http_help = self.plugin.COMMAND_PROVIDER.handle(
+                "alert describe http", self.context
+            )
+            unknown = self.plugin.COMMAND_PROVIDER.handle(
+                "alert help unknown", self.context
+            )
+        self.assertIn("`alert help <类型>`", summary)
+        self.assertIn("不是底层模型权重名称", summary)
+        self.assertIn("models.json", model_help)
+        self.assertIn("model=<模型实例>", model_help)
+        self.assertIn("url=<http(s)://地址>", http_help)
+        self.assertIn("unknown alert type", unknown)
 
     def test_service_check_reports_healthy_container_and_http_endpoint(self):
         with mock.patch.dict(os.environ, {"MODEL_MANAGER_CONFIG": str(self.config)}):

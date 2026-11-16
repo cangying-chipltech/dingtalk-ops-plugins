@@ -5,7 +5,10 @@
       "node": "web-01",
       "logPath": "/data/applogs/vllm.log",
       "tailLines": 10,
-      "alertPatterns": ["No available shared memory broadcast"],
+      "alertPatterns": [
+        "No available shared memory broadcast",
+        "Shutting down"
+      ],
       "intervalSeconds": 60,
       "timeoutSeconds": 20,
       "severity": "critical",

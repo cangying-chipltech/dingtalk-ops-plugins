@@ -10,6 +10,8 @@ plugins/model-manager/
   config/models.json
   config/models.example.json
   src/model_manager_plugin/__init__.py
+  src/model_manager_plugin/alerts.py
+  src/model_manager_plugin/model_state.py
   tests/test_model_manager.py
 ```
 
@@ -27,7 +29,10 @@ manifest 同时注册 `model-log`、`node-service` monitor provider、`model` �
       "node": "hangdian2-27",
       "logPath": "/data/applogs/vllm.log",
       "tailLines": 10,
-      "alertPatterns": ["No available shared memory broadcast"],
+      "alertPatterns": [
+        "No available shared memory broadcast",
+        "Shutting down"
+      ],
       "monitorName": "vllm-shared-memory-27",
       "intervalSeconds": 60,
       "timeoutSeconds": 20,
@@ -73,6 +78,11 @@ manifest 同时注册 `model-log`、`node-service` monitor provider、`model` �
 model list
 model check vllm-27
 model check vllm-27,vllm-31
+model add name=vllm-32 node=hangdian2-32 logPath=/data/applogs/vllm.log alertPatterns='Shutting down'
+alert list
+alert disable vllm-shared-memory-27
+alert remove newapi-status-205
+alert add name=extra-vllm type=model-log model=vllm-31 intervalSeconds=30
 monitor check newapi-status-205
 models
 模型
@@ -80,15 +90,75 @@ models
 
 `model list` 显示模型和服务监控配置。`model check` 立即读取最近 `tailLines` 行，命中任一 `alertPatterns` 时返回异常；服务监控用 `monitor check <监控名>` 立即执行。
 
+## 动态添加模型
+
+运行时可通过钉钉添加模型，不修改只读的插件配置文件：
+
+```text
+model add name=vllm-32 node=hangdian2-32 logPath=/data/applogs/vllm.log alertPatterns='Shutting down,No available shared memory broadcast'
+```
+
+必填参数为 `name`、`node`、`logPath` 和 `alertPatterns`。可选参数包括
+`description`、`monitorName`、`tailLines`、`intervalSeconds`、`timeoutSeconds`、
+`severity`、`repeatAlertSeconds`、`notifyRecovery` 和 `enabled`。多个关键字用逗号分隔，
+也可传 JSON 数组。模型名和监控名必须唯一，`node` 必须存在，`logPath` 必须是绝对路径。
+
+动态模型默认写入 `DATA_DIR/model-manager-models.json`，文件权限为 `0600`，可用
+`MODEL_MANAGER_MODEL_STATE_FILE` 覆盖路径。`model list` 会将来源标为“动态添加”，
+`model check` 可立即验证；`bridge` 无需重启。新增监控要由后台进程加载，因此执行：
+
+```bash
+docker compose restart monitor
+```
+
+## 告警管理
+
+告警项的关闭、移出和添加由 model-manager 插件管理，不修改固定框架镜像。状态默认写入
+`DATA_DIR/model-manager-alert-management.json`，可用
+`MODEL_MANAGER_ALERT_STATE_FILE` 覆盖路径。
+
+```text
+alert list
+alert help
+alert help model-log
+alert help http
+alert disable vllm-shared-memory-27,newapi-status-205
+alert enable vllm-shared-memory-27,newapi-status-205
+alert remove newapi-status-205
+alert restore newapi-status-205
+alert add name=extra-vllm type=model-log model=vllm-31 intervalSeconds=30 severity=warning
+alert add name=extra-service type=node-service service=newapi-205
+alert add name=api-health type=http url=http://127.0.0.1:8080/health expectedStatus=200
+alert add name=redis-port type=tcp host=10.0.0.12 port=6379
+alert add name=host-ready type=command command='hostname' stdoutContains=worker
+```
+
+`disable` 保留定义但关闭调度；`remove` 将告警移出；`restore` 恢复已移出项。
+`add` 支持 `model-log`、`node-service`、`http`、`tcp` 和 `command`。新增或移出后，
+重启 `monitor` 容器使框架重新读取插件的监控定义：
+
+`alert help <类型>` 显示该类型的必填参数和示例。`model-log` 中的 `model` 指
+`config/models.json` 里 `models` 下的实例键（例如 `vllm-31`），它关联节点、日志路径和
+异常关键字，不是底层模型权重名称。`node-service` 中的 `service` 同理，指向 `services`
+下的服务实例键。
+
+```bash
+docker compose restart monitor
+```
+
+这是固定框架仅提供启动时 monitor provider 加载接口造成的限制；桥接容器无需重启。
+
 ## 监控
 
 框架加载监控时调用插件的 `monitors(context)`，为每个模型生成 `model-log` 监控项，为每个服务生成 `node-service` 监控项。后台 monitor 进程发现异常或恢复后，仍由框架统一发送钉钉 Webhook。
 
-修改模型、节点、日志或关键字后，只需重启服务：
+修改静态模型、节点、日志或关键字后，重启服务：
 
 ```bash
 docker compose restart bridge monitor
 ```
+
+通过 `model add` 添加的模型已持久化到 `DATA_DIR`，只重启 `monitor` 即可开始周期告警。
 
 ## 验证
 

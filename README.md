@@ -5,7 +5,7 @@
 ## 插件
 
 - `nodes/`：节点清单、SSH 动作和 `nodes` 服务。
-- `model-manager/`：模型清单、`model-log` 监控和 `model` 命令。
+- `model-manager/`：模型清单、`model-log` 监控、`model` 命令和 `alert` 告警管理。
 - `swe-runner/`：swe-runner 查询动作与旧命令兼容。
 
 ## 部署
